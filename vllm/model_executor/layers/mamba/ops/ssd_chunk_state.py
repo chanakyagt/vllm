@@ -195,7 +195,7 @@ def _chunk_cumsum_fwd_kernel(
     ],
     key=["hdim", "dstate", "chunk_size"],
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["final_state_indices_ptr"])
 def _chunk_state_fwd_kernel(
     # Pointers to matrices
     x_ptr,
@@ -204,6 +204,11 @@ def _chunk_state_fwd_kernel(
     dt_ptr,
     dA_cumsum_ptr,
     cu_chunk_seqlens_ptr,
+    seq_idx_ptr,
+    last_chunk_indices_ptr,
+    initstates_ptr,
+    final_states_ptr,
+    final_state_indices_ptr,
     # Matrix dimensions
     hdim: tl.constexpr,
     dstate: tl.constexpr,
@@ -226,7 +231,18 @@ def _chunk_state_fwd_kernel(
     stride_dA_cs_head: tl.int64,
     stride_dA_cs_chunk: tl.int64,
     stride_dA_cs_csize: tl.constexpr,
+    stride_initstates_batch: tl.int64,
+    stride_initstates_head: tl.int64,
+    stride_initstates_hdim: tl.int64,
+    stride_initstates_dstate: tl.constexpr,
+    stride_final_states_slot: tl.int64,
+    stride_final_states_head: tl.int64,
+    stride_final_states_hdim: tl.int64,
+    stride_final_states_dstate: tl.constexpr,
+    stride_final_state_indices,
     # Meta-parameters
+    HAS_INITSTATES: tl.constexpr,
+    FUSE_FINAL_STATES: tl.constexpr,
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,
@@ -291,16 +307,50 @@ def _chunk_state_fwd_kernel(
         dt_ptrs += BLOCK_SIZE_K * stride_dt_csize
         dA_cumsum_ptrs += BLOCK_SIZE_K * stride_dA_cs_csize
 
-    states = acc.to(states_ptr.dtype.element_ty)
-
-    states_ptr += pid_c * stride_states_chunk + pid_h * stride_states_head
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
+    states_ptr += pid_c * stride_states_chunk + pid_h * stride_states_head
     states_ptrs = states_ptr + (
         offs_m[:, None] * stride_states_hdim + offs_n[None, :] * stride_states_dstate
     )
-    c_mask = (offs_m[:, None] < hdim) & (offs_n[None, :] < dstate)
-    tl.store(states_ptrs, states, mask=c_mask)
+
+    if FUSE_FINAL_STATES:
+        # A sequence that fits in one chunk has its final state right here:
+        # final = exp(dA_cs_last) * initial + chunk state. Write it into the
+        # sequence's cache slot and skip the fp32 per-chunk state, which
+        # _state_passing_fwd would only read back to compute the same value.
+        seq = tl.load(seq_idx_ptr + pid_c)
+        seq_prev = tl.load(seq_idx_ptr + pid_c - 1, mask=pid_c >= 1, other=-1)
+        seq_last_chunk = tl.load(last_chunk_indices_ptr + seq)
+        if (seq != seq_prev) and (seq_last_chunk == pid_c):
+            final = acc
+            if HAS_INITSTATES:
+                init = tl.load(
+                    initstates_ptr
+                    + seq * stride_initstates_batch
+                    + pid_h * stride_initstates_head
+                    + offs_m[:, None] * stride_initstates_hdim
+                    + offs_n[None, :] * stride_initstates_dstate,
+                    mask=c_mask,
+                    other=0.0,
+                ).to(tl.float32)
+                final = fast_exp(dA_cs_last) * init + acc
+            slot = tl.load(
+                final_state_indices_ptr + seq * stride_final_state_indices
+            ).to(tl.int64)
+            final_states_ptrs = (
+                final_states_ptr
+                + slot * stride_final_states_slot
+                + pid_h * stride_final_states_head
+                + offs_m[:, None] * stride_final_states_hdim
+                + offs_n[None, :] * stride_final_states_dstate
+            )
+            tl.store(final_states_ptrs, final, mask=c_mask)
+        else:
+            tl.store(states_ptrs, acc.to(states_ptr.dtype.element_ty), mask=c_mask)
+    else:
+        tl.store(states_ptrs, acc.to(states_ptr.dtype.element_ty), mask=c_mask)
 
 
 def _chunk_cumsum_fwd(
@@ -355,8 +405,25 @@ def _chunk_cumsum_fwd(
 
 
 def _chunk_state_fwd(
-    B, x, dt, dA_cumsum, cu_chunk_seqlens, states=None, states_in_fp32=True
+    B,
+    x,
+    dt,
+    dA_cumsum,
+    cu_chunk_seqlens,
+    states=None,
+    states_in_fp32=True,
+    seq_idx=None,
+    last_chunk_indices=None,
+    initial_states=None,
+    final_states=None,
+    final_state_indices=None,
 ):
+    """If `final_states` is given (with `seq_idx`, `last_chunk_indices` and
+    `final_state_indices`), each sequence that fits in a single chunk gets its
+    final state written to
+    `final_states[final_state_indices[seq]]` here, and its entry in `states` is
+    left unwritten. `_state_passing_fwd(..., skip_single_chunk_seqs=True)` then
+    skips those sequences."""
     seqlen, nheads, headdim = x.shape
     _, nchunks, chunk_size = dt.shape
     _, ngroups, dstate = B.shape
@@ -373,6 +440,16 @@ def _chunk_state_fwd(
             (nchunks, nheads, headdim, dstate), device=x.device, dtype=states_dtype
         )
 
+    fuse = final_states is not None
+    if fuse:
+        assert seq_idx is not None and final_state_indices is not None
+        assert last_chunk_indices is not None
+        assert final_states.shape[1:] == (nheads, headdim, dstate)
+    init_strides = (
+        initial_states.stride() if fuse and initial_states is not None else (0,) * 4
+    )
+    final_strides = final_states.stride() if fuse else (0,) * 4
+
     grid = lambda META: (
         triton.cdiv(headdim, META["BLOCK_SIZE_M"])
         * triton.cdiv(dstate, META["BLOCK_SIZE_N"]),
@@ -388,6 +465,11 @@ def _chunk_state_fwd(
         dt_ptr=dt,
         dA_cumsum_ptr=dA_cumsum,
         cu_chunk_seqlens_ptr=cu_chunk_seqlens,
+        seq_idx_ptr=seq_idx if fuse else None,
+        last_chunk_indices_ptr=last_chunk_indices if fuse else None,
+        initstates_ptr=initial_states if fuse else None,
+        final_states_ptr=final_states,
+        final_state_indices_ptr=final_state_indices if fuse else None,
         hdim=headdim,
         dstate=dstate,
         chunk_size=chunk_size,
@@ -408,5 +490,16 @@ def _chunk_state_fwd(
         stride_dA_cs_head=dA_cumsum.stride(0),
         stride_dA_cs_chunk=dA_cumsum.stride(1),
         stride_dA_cs_csize=dA_cumsum.stride(2),
+        stride_initstates_batch=init_strides[0],
+        stride_initstates_head=init_strides[1],
+        stride_initstates_hdim=init_strides[2],
+        stride_initstates_dstate=init_strides[3],
+        stride_final_states_slot=final_strides[0],
+        stride_final_states_head=final_strides[1],
+        stride_final_states_hdim=final_strides[2],
+        stride_final_states_dstate=final_strides[3],
+        stride_final_state_indices=final_state_indices.stride(0) if fuse else 0,
+        HAS_INITSTATES=fuse and initial_states is not None,
+        FUSE_FINAL_STATES=fuse,
     )
     return states

@@ -102,8 +102,26 @@ def _mamba_chunk_scan_combined_fwd(
 
     # 2. Compute the state for each intra-chunk
     # (right term of low-rank factorization of off-diagonal blocks; B terms)
+    # - with a state cache to write into, sequences that fit in one chunk get
+    #   their final state written here and skip the state passing below
+    #   (not when the caller also wants every chunk's state back)
+    fuse_final = (
+        final_states_out is not None
+        and seq_idx is not None
+        and not return_intermediate_states
+    )
     states = _chunk_state_fwd(
-        B, x, dt, dA_cumsum, cu_chunk_seqlens, states_in_fp32=True
+        B,
+        x,
+        dt,
+        dA_cumsum,
+        cu_chunk_seqlens,
+        states_in_fp32=True,
+        seq_idx=seq_idx if fuse_final else None,
+        last_chunk_indices=last_chunk_indices if fuse_final else None,
+        initial_states=initial_states if fuse_final else None,
+        final_states=final_states_out if fuse_final else None,
+        final_state_indices=final_state_indices if fuse_final else None,
     )
 
     # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
@@ -122,6 +140,7 @@ def _mamba_chunk_scan_combined_fwd(
         if final_states_out is not None
         else None,  # (num_slots, nheads, headdim*dstate)
         final_state_indices=final_state_indices,
+        skip_single_chunk_seqs=fuse_final,
     )
     states = states.unflatten(-1, (headdim, dstate))
 

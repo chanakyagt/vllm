@@ -11,6 +11,7 @@ from vllm.model_executor.layers.mamba.ops.ssd_chunk_scan import (
     _chunk_scan_fwd_kernel,
 )
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
+    _mamba_chunk_scan_combined_fwd,
     mamba_chunk_scan_combined_varlen,
 )
 from vllm.platforms import current_platform
@@ -625,3 +626,108 @@ def test_chunk_scan_fwd_every_config_matches(monkeypatch):
                 rtol=2e-2,
                 msg=lambda m, config=config: f"{config}: {m}",
             )
+
+
+@pytest.mark.parametrize("chunk_size", [8, 256])
+@pytest.mark.parametrize("has_initial_states", [False, True])
+def test_mamba_chunk_scan_final_states_out(chunk_size, has_initial_states, monkeypatch):
+    """Writing each sequence's final state into a state cache (final_states_out)
+    must match returning the states. The batch mixes sequences that fit in one
+    chunk, whose final state _chunk_state_fwd writes itself, with longer ones.
+    Asking for every chunk's state as well must still return all of them."""
+    from vllm.model_executor.layers.mamba.ops import triton_helpers
+    from vllm.model_executor.layers.mamba.ops.ssd_chunk_state import (
+        _chunk_state_fwd_kernel,
+    )
+
+    # The fused and unfused launches autotune separately; pin one config so the
+    # zero-tolerance comparison does not depend on two independent picks.
+    config = min(
+        _chunk_state_fwd_kernel.configs,
+        key=lambda c: c.kwargs["BLOCK_SIZE_M"] * c.kwargs["BLOCK_SIZE_N"],
+    )
+    monkeypatch.setattr(_chunk_state_fwd_kernel, "configs", [config])
+    monkeypatch.setattr(triton_helpers, "_autotuned_configs", {})
+    set_random_seed(0)
+    seqlens = (5, 300, 1, 40, 256, 513, 7, 8, 8, 8)
+    nheads, headdim, ngroups, dstate = 8, 32, 2, 64
+    dtype = torch.bfloat16
+    batch, seqlen = len(seqlens), sum(seqlens)
+    cu_seqlens = torch.zeros(batch + 1, dtype=torch.int32, device=DEVICE)
+    cu_seqlens[1:] = torch.tensor(seqlens, device=DEVICE).cumsum(0)
+    cu_chunk_seqlens, last_chunk_indices, seq_idx_chunks = (
+        compute_varlen_chunk_metadata(cu_seqlens, chunk_size)
+    )
+
+    x = torch.randn(seqlen, nheads, headdim, dtype=dtype, device=DEVICE)
+    dt = torch.randn(seqlen, nheads, dtype=dtype, device=DEVICE)
+    A = -torch.rand(nheads, device=DEVICE)
+    B = torch.randn(seqlen, ngroups, dstate, dtype=dtype, device=DEVICE)
+    C = torch.randn(seqlen, ngroups, dstate, dtype=dtype, device=DEVICE)
+    D = torch.randn(nheads, device=DEVICE)
+    dt_bias = torch.randn(nheads, device=DEVICE)
+    initial_states = (
+        torch.randn(batch, nheads, headdim, dstate, dtype=dtype, device=DEVICE)
+        if has_initial_states
+        else None
+    )
+
+    def run(**kwargs):
+        out = torch.empty_like(x)
+        states = _mamba_chunk_scan_combined_fwd(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            chunk_size,
+            out,
+            D=D,
+            dt_bias=dt_bias,
+            initial_states=initial_states,
+            seq_idx=seq_idx_chunks,
+            cu_seqlens=cu_seqlens,
+            cu_chunk_seqlens=cu_chunk_seqlens,
+            last_chunk_indices=last_chunk_indices,
+            dt_softplus=True,
+            state_dtype=dtype,
+            **kwargs,
+        )
+        return out, states
+
+    out_ref, chunk_states_ref = run(return_intermediate_states=True)
+    states_ref = chunk_states_ref[last_chunk_indices]
+
+    # Slots in reverse order with unused slots around them, which must not change.
+    # As in the mamba metadata builder, the prefill slots are column 0 of a 2-D
+    # table (a strided view); the other columns point at unused slots.
+    slots = torch.arange(batch, device=DEVICE, dtype=torch.int32).flip(0) + 2
+    slot_table = torch.stack(
+        [slots, torch.zeros_like(slots), torch.ones_like(slots)], 1
+    )
+    slots = slot_table[:, 0]
+    assert slots.stride(0) == 3
+    unused = torch.ones(batch + 3, dtype=torch.bool, device=DEVICE)
+    unused[slots.long()] = False
+    for return_intermediate_states in (False, True):
+        # Leave NaNs in freed memory, so a read of a chunk state that was not
+        # written shows up instead of finding the reference run's values.
+        torch.full(
+            chunk_states_ref.shape, float("nan"), dtype=torch.float32, device=DEVICE
+        )
+        cache = torch.randn(
+            batch + 3, nheads, headdim, dstate, dtype=dtype, device=DEVICE
+        )
+        cache_before = cache.clone()
+        out, ret = run(
+            final_states_out=cache,
+            final_state_indices=slots,
+            return_intermediate_states=return_intermediate_states,
+        )
+        torch.testing.assert_close(out, out_ref, atol=0, rtol=0)
+        torch.testing.assert_close(cache[slots.long()], states_ref, atol=0, rtol=0)
+        assert torch.equal(cache[unused], cache_before[unused])
+        if return_intermediate_states:
+            torch.testing.assert_close(ret, chunk_states_ref, atol=0, rtol=0)
+        else:
+            assert ret is None

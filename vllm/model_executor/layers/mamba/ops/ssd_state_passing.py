@@ -59,6 +59,7 @@ def _state_passing_fwd_kernel(
     # Meta-parameters
     HAS_INITSTATES: tl.constexpr,
     HAS_FINAL_STATES: tl.constexpr,
+    SKIP_SINGLE_CHUNK_SEQS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -70,6 +71,11 @@ def _state_passing_fwd_kernel(
     chunk_start = (
         tl.load(last_chunk_indices_ptr + pid_b - 1, mask=pid_b > 0, other=-1) + 1
     )
+    nchunks_this_seq = chunk_end - chunk_start
+    # With SKIP_SINGLE_CHUNK_SEQS, _chunk_state_fwd already wrote the final state
+    # of a single-chunk sequence.
+    if SKIP_SINGLE_CHUNK_SEQS and nchunks_this_seq == 1:
+        return
 
     # Offset pointers to this sequence's first chunk
     states_ptr += chunk_start * stride_states_chunk + pid_h * stride_states_head
@@ -97,7 +103,6 @@ def _state_passing_fwd_kernel(
         states = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
     # Loop over only this sequence's chunks — branchless
-    nchunks_this_seq = chunk_end - chunk_start
     for _ in range(nchunks_this_seq):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
@@ -130,9 +135,15 @@ def _state_passing_fwd(
     out_dtype=None,
     final_states=None,
     final_state_indices=None,
+    skip_single_chunk_seqs=False,
 ):
     """`final_states` (num_slots, nheads, dim), if given, receives each
-    sequence's final state at slot `final_state_indices[b]`."""
+    sequence's final state at slot `final_state_indices[b]`.
+
+    `skip_single_chunk_seqs` (needs `final_states`) is for use after
+    `_chunk_state_fwd(..., final_states=...)`: single-chunk sequences, whose
+    final state that call already wrote, are skipped."""
+    assert not skip_single_chunk_seqs or final_states is not None
     nchunks, nheads, dim = states.shape
     chunk_size = dA_cumsum.shape[-1]
     batch = last_chunk_indices.shape[0]
@@ -188,5 +199,6 @@ def _state_passing_fwd(
         ),
         HAS_INITSTATES=initial_states is not None,
         HAS_FINAL_STATES=final_states is not None,
+        SKIP_SINGLE_CHUNK_SEQS=skip_single_chunk_seqs,
     )
     return out

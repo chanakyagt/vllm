@@ -678,9 +678,12 @@ class MambaMixer2(MambaBase, PluggableLayer):
 
         # SSD kernel autotune keys depend on dtype and head dimensions,
         # not on sequence length or batch size, so a single shape suffices.
-        seqlen = chunk_size
+        # Use two chunks: _state_passing_fwd skips single-chunk sequences
+        # when final states go straight to the cache, and it must autotune
+        # on launches that do real work.
+        seqlen = 2 * chunk_size
         batch = 1
-        nchunks = seqlen // chunk_size  # = 1
+        nchunks = seqlen // chunk_size  # = 2
 
         x = torch.randn(seqlen, nheads, headdim, device=device, dtype=dtype)
         dt = torch.randn(seqlen, nheads, device=device, dtype=dtype)
@@ -702,9 +705,10 @@ class MambaMixer2(MambaBase, PluggableLayer):
         )
         final_state_indices = torch.zeros(batch, device=device, dtype=torch.int32)
 
-        # Two kernels (_state_passing_fwd, _chunk_scan_fwd) use
-        # HAS_INITSTATES as a constexpr, and _state_passing_fwd also
-        # HAS_FINAL_STATES, producing separate compiled binaries. Warm up
+        # Three kernels (_chunk_state_fwd, _state_passing_fwd, _chunk_scan_fwd)
+        # use HAS_INITSTATES as a constexpr, _state_passing_fwd also
+        # HAS_FINAL_STATES and _chunk_state_fwd FUSE_FINAL_STATES, producing
+        # separate compiled binaries. Warm up
         # all code paths so none triggers JIT compilation during inference.
         for use_initial_states, write_final_states in itertools.product(
             (False, True), repeat=2

@@ -277,6 +277,10 @@ def _chunk_scan_fwd_kernel(
         prev_states_dstate = stride_states_dstate
 
     chunk_size_limit = chunk_seqlen_end - chunk_seqlen_start
+    # Chunks are often shorter than chunk_size (short sequences, sequence
+    # boundaries). M-blocks past the chunk end would write nothing, so skip them.
+    if pid_m * BLOCK_SIZE_M >= chunk_size_limit:
+        return
 
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     dA_cs_m = tl.load(
